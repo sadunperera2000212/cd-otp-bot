@@ -12,13 +12,19 @@ from pathlib import Path
 import httpx
 from bs4 import BeautifulSoup
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
-# ✅ ADDED: Telegram request config + network error types
+# ✅ Telegram request config + network error types
 from telegram.request import HTTPXRequest
 from telegram.error import Forbidden, RetryAfter, BadRequest, TimedOut, NetworkError
 
-# ✅ ADDED: Redis (shared storage for watcher watchlist)
+# ✅ Redis (shared storage for watcher watchlist)
 import redis.asyncio as redis
 
 logging.basicConfig(
@@ -42,17 +48,17 @@ DELAY_SECONDS = int(os.getenv("DELAY_SECONDS", "30"))
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
 COOLDOWN_SECONDS = 91  # ~3 minutes cooldown after success OR "no OTP"
 
-# ✅ ADDED: Redis URL for shared watchlist storage
+# ✅ Redis URL for shared watchlist storage
 REDIS_URL = os.getenv("REDIS_URL", "").strip()
 
 # Self-healing knobs (optional)
 RESTART_EVERY_MIN = int(os.getenv("RESTART_EVERY_MIN", "0"))  # 0 = disabled
-ERROR_RESTART_THRESHOLD = int(os.getenv("ERROR_RESTART_THRESHOLD", "6"))  # restart if this many network errors in a row
+ERROR_RESTART_THRESHOLD = int(os.getenv("ERROR_RESTART_THRESHOLD", "6"))
 # ---------------------------
 
 OTP_PATTERN = re.compile(r"\b(\d{6})\b")
 
-# ✅ ADDED: Redis keys for warning watcher
+# ✅ Redis keys for warning watcher
 WATCHLIST_KEY = "warn:watchlist"          # Redis SET of emails
 INTERVAL_KEY = "warn:interval_min"        # Redis STRING minutes
 
@@ -72,7 +78,13 @@ def _parse_ids(text: str):
     return [int(x) for x in re.findall(r"\d+", text or "")]
 
 
-# ✅ ADDED: Redis client (used by new /wadd /wremove /wlist /winterval commands)
+def _looks_like_email(text: str) -> bool:
+    # simple email check
+    t = (text or "").strip().lower()
+    return bool(re.match(r"^[^\s@]+@[^\s@]+\.[^\s@]+$", t))
+
+
+# ✅ Redis client (watchlist commands)
 redis_client = redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
 
 
@@ -214,7 +226,6 @@ async def fetch_otp_from_generator(email: str) -> Optional[str]:
 
     max_retries = 3
 
-    # ✅ Slightly more forgiving timeout for generator.email
     async with httpx.AsyncClient(timeout=httpx.Timeout(25.0), follow_redirects=True) as client:
         for attempt in range(max_retries):
             try:
@@ -340,23 +351,26 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     domains_text = _allowed_domains_text()
 
+    # ✅ NEW: CyberDeals welcome message (no /otp needed)
     welcome_text = (
-        f"✨ Welcome to Digital Creed OTP Service ✨\n\n"
-        f"🔹 Need a quick OTP? Just send:\n"
-        f"/otp yourname@yourdomain\n\n"
-        f"✅ Allowed domains: {domains_text}\n\n"
-        f"⏱️ I’ll wait {DELAY_SECONDS} seconds before checking your inbox to make sure your code arrives.\n\n"
-        f"👤 Each user can make up to {MAX_REQUESTS_PER_USER} requests in total.\n\n"
-        f"🚫 After every check — whether an OTP is found or not — please wait 3 minutes before making another request.\n\n"
-        f"💡 Tip: Double-check your email spelling for faster results!\n\n"
-        f"📩 Example:\n"
-        f"/otp yourname@{ALLOWED_DOMAIN[0] if ALLOWED_DOMAIN else 'yourdomain'}"
+        "✨ Welcome to *CyberDeals* OTP Service ✨\n\n"
+        "📩 *How to get your OTP:*\n"
+        "Just send your email address here (no commands needed).\n\n"
+        "✅ *Examples you can copy:*\n"
+        
+        "• cyberdeals.ajanthan41@kabarr.com\n\n"
+        f"🌐 *Allowed domains:* {domains_text}\n\n"
+        f"⏳ After you send the email, I’ll wait *{DELAY_SECONDS} seconds* and then check the inbox.\n\n"
+        f"📊 Each user can request up to *{MAX_REQUESTS_PER_USER}* OTP checks in total.\n\n"
+        "🕒 After every check (OTP found or not), please wait *3 minutes* before sending another email.\n\n"
+        "💡 Tip: Make sure the email spelling is correct to get the OTP faster."
     )
 
-    await update.message.reply_text(welcome_text)
+    await update.message.reply_text(welcome_text, parse_mode="Markdown")
 
 
-async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def _process_email_request(update: Update, context: ContextTypes.DEFAULT_TYPE, email: str):
+    """Shared logic: validate + cooldown + fetch OTP + reply."""
     if not update.message:
         return
 
@@ -375,17 +389,21 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(f"⏳ Please wait {cd} seconds before requesting again.")
             return
 
-    if not context.args:
+    email = (email or "").strip().lower()
+
+    if not _looks_like_email(email):
         await update.message.reply_text(
-            "❌ Please provide an email address.\n"
-            f"Example: /otp yourname@{ALLOWED_DOMAIN[0] if ALLOWED_DOMAIN else 'yourdomain'}"
+            "❌ That doesn’t look like a valid email.\n\n"
+            "✅ Send only the email address like this:\n"
+            "• cyberdeals.kaviska@eliotkids.com\n"
+            "• cyberdeals.ajanthan41@kabarr.com"
         )
         return
 
-    email = context.args[0].strip().lower()
-
     if not _is_allowed_domain(email):
-        await update.message.reply_text(f"❌ Invalid email domain. Only {_allowed_domains_text()} is supported.")
+        await update.message.reply_text(
+            f"❌ Invalid email domain.\nOnly these are supported: {_allowed_domains_text()}"
+        )
         return
 
     if state_manager.is_blocked(email):
@@ -411,8 +429,9 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         remaining_if_success = "∞"
 
     await update.message.reply_text(
-        f"⏳ Waiting {DELAY_SECONDS} seconds before checking…\n"
+        f"⏳ Got it! Checking soon…\n"
         f"📧 {email}\n"
+        f"⏱️ Waiting {DELAY_SECONDS} seconds\n"
         f"📊 Remaining (if success): {remaining_if_success}"
     )
 
@@ -487,7 +506,7 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         except Exception as e:
-            logger.error(f"Unexpected error in otp_command: {e}")
+            logger.error(f"Unexpected error: {e}")
 
             try:
                 with open("otp_log.txt", "a") as lf:
@@ -498,6 +517,22 @@ async def otp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             _note_net_error_and_maybe_restart()
             await update.message.reply_text("❌ An unexpected error occurred. Please try again.")
             return
+
+
+# ✅ NEW: user sends plain email message (no /otp command)
+async def email_message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
+    text = (update.message.text or "").strip()
+    if not text:
+        return
+
+    # ignore if it's a command just in case
+    if text.startswith("/"):
+        return
+
+    await _process_email_request(update, context, text)
 
 
 async def remaining_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -559,7 +594,7 @@ async def clearemail_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not context.args:
         await update.message.reply_text(
             "❌ Usage: /clearemail <email>\n"
-            f"Example: /clearemail user@{ALLOWED_DOMAIN[0] if ALLOWED_DOMAIN else 'yourdomain'}"
+            f"Example: /clearemail cyberdeals.user@{ALLOWED_DOMAIN[0] if ALLOWED_DOMAIN else 'yourdomain'}"
         )
         return
 
@@ -584,7 +619,7 @@ async def block_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text(
             "❌ Usage: /block <email>\n"
-            f"Example: /block user@{ALLOWED_DOMAIN[0] if ALLOWED_DOMAIN else 'yourdomain'}"
+            f"Example: /block cyberdeals.user@{ALLOWED_DOMAIN[0] if ALLOWED_DOMAIN else 'yourdomain'}"
         )
         return
 
@@ -618,7 +653,7 @@ async def unblock_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text(
             "❌ Usage: /unblock <email>\n"
-            f"Example: /unblock user@{ALLOWED_DOMAIN[0] if ALLOWED_DOMAIN else 'yourdomain'}"
+            f"Example: /unblock cyberdeals.user@{ALLOWED_DOMAIN[0] if ALLOWED_DOMAIN else 'yourdomain'}"
         )
         return
 
@@ -777,7 +812,7 @@ async def addusers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Added {after - before} users to subscribers.")
 
 
-# ✅ ADDED: Watchlist commands (admin only) using Redis
+# ✅ Watchlist commands (admin only) using Redis
 async def wadd_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
@@ -961,7 +996,6 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
 
 
 def _build_application() -> Application:
-    # ✅ FIX: Bigger Telegram API timeouts so getMe() doesn't kill you on slow networks
     tg_request = HTTPXRequest(
         connect_timeout=30,
         read_timeout=30,
@@ -978,7 +1012,11 @@ def _build_application() -> Application:
     )
 
     app.add_handler(CommandHandler("start", start_command))
-    app.add_handler(CommandHandler("otp", otp_command))
+
+    # ✅ NEW: user sends email as normal message (no /otp)
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, email_message_handler))
+
+    # keep other commands
     app.add_handler(CommandHandler("remaining", remaining_command))
     app.add_handler(CommandHandler("resetlimit", resetlimit_command))
     app.add_handler(CommandHandler("clearemail", clearemail_command))
@@ -988,7 +1026,7 @@ def _build_application() -> Application:
     app.add_handler(CommandHandler("dash", dash_command))
     app.add_handler(CommandHandler("addusers", addusers_command))
 
-    # ✅ ADDED: Watchlist handlers for warning watcher (admin only)
+    # watchlist
     app.add_handler(CommandHandler("wadd", wadd_command))
     app.add_handler(CommandHandler("wremove", wremove_command))
     app.add_handler(CommandHandler("wlist", wlist_command))
@@ -1012,18 +1050,16 @@ def main():
     logger.info("Starting OTP bot...")
     _start_timed_restart_thread()
 
-    # ✅ FIX: never crash hard on Telegram startup timeouts; retry with backoff hhh
     backoff = 2
     while True:
         try:
             application = _build_application()
             application.run_polling(allowed_updates=Update.ALL_TYPES)
-            # If it exits normally, reset backoff and loop (or just break)
             backoff = 2
         except (TimedOut, NetworkError, httpx.HTTPError, OSError) as e:
             logger.error(f"Telegram/network startup error: {e} — retrying in {backoff}s")
             time.sleep(backoff)
-            backoff = min(backoff * 2, 60)  # cap at 60s
+            backoff = min(backoff * 2, 60)
             continue
         except Exception as e:
             logger.exception(f"Fatal unexpected error: {e}")
