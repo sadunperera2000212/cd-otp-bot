@@ -24,7 +24,7 @@ from telegram.ext import (
 from telegram.request import HTTPXRequest
 from telegram.error import Forbidden, RetryAfter, BadRequest, TimedOut, NetworkError
 
-# ✅ Redis (shared storage for watcher watchlist + checklist)
+# ✅ Redis (optional; only for watchlist commands if you still want)
 import redis.asyncio as redis
 
 logging.basicConfig(
@@ -48,7 +48,7 @@ DELAY_SECONDS = int(os.getenv("DELAY_SECONDS", "30"))
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
 COOLDOWN_SECONDS = 91  # ~3 minutes cooldown after success OR "no OTP"
 
-# ✅ Redis URL for shared storage
+# ✅ Redis URL (OPTIONAL now)
 REDIS_URL = os.getenv("REDIS_URL", "").strip()
 
 # Self-healing knobs (optional)
@@ -58,12 +58,12 @@ ERROR_RESTART_THRESHOLD = int(os.getenv("ERROR_RESTART_THRESHOLD", "6"))
 
 OTP_PATTERN = re.compile(r"\b(\d{6})\b")
 
-# ✅ Redis keys for warning watcher
+# ✅ Redis keys for warning watcher (ONLY if REDIS_URL is set)
 WATCHLIST_KEY = "warn:watchlist"          # Redis SET of emails
 INTERVAL_KEY = "warn:interval_min"        # Redis STRING minutes
 
-# ✅ NEW: Redis key for /elistadd + /check
-CHECKLIST_KEY = "check:emaillist"         # Redis SET of emails to scan in /check
+# ✅ NEW FEATURE (NO REDIS): checklist stored in state.json
+CHECKLIST_STATE_KEY = "checklist_emails"
 
 # ✅ FIXED subject for /check (ONLY /check, no args)
 FIXED_SUBJECT = "OpenAI - Access Deactivated"
@@ -89,17 +89,46 @@ def _looks_like_email(text: str) -> bool:
     return bool(re.match(r"^[^\s@]+@[^\s@]+\.[^\s@]+$", t))
 
 
-def _split_emails_arg(args) -> list[str]:
-    raw = " ".join(args or []).strip().lower()
-    parts = re.split(r"[,\s]+", raw)
-    return [p.strip() for p in parts if p.strip()]
-
-
 def _norm_spaces(s: str) -> str:
     return " ".join((s or "").split()).strip()
 
 
-# ✅ Redis client (watchlist + checklist)
+def _extract_text_after_command(update: Update, command: str) -> str:
+    """
+    Lets you do:
+    /elistadd a@d.com
+    b@d.com
+    c@d.com
+
+    and it will capture everything after "/elistadd"
+    """
+    if not update.message or not update.message.text:
+        return ""
+    txt = update.message.text.strip()
+    # command could be "/elistadd" exactly
+    if not txt.lower().startswith(command.lower()):
+        return ""
+    rest = txt[len(command):].strip()
+    return rest
+
+
+def _parse_emails_from_blob(blob: str) -> list[str]:
+    """
+    Accepts comma-separated, space-separated, or newline-separated emails.
+    """
+    raw = (blob or "").strip()
+    if not raw:
+        return []
+    parts = re.split(r"[,\s]+", raw)
+    emails = []
+    for p in parts:
+        p = (p or "").strip().lower()
+        if p:
+            emails.append(p)
+    return emails
+
+
+# ✅ Redis client (ONLY used by watchlist commands)
 redis_client = redis.from_url(REDIS_URL, decode_responses=True) if REDIS_URL else None
 
 
@@ -125,6 +154,9 @@ class StateManager:
         data.setdefault("cooldowns", {})
         data.setdefault("blocked_emails", {})
         data.setdefault("subscribers", [])
+
+        # ✅ NEW: store checklist (no Redis)
+        data.setdefault(CHECKLIST_STATE_KEY, [])
 
         return data
 
@@ -191,7 +223,8 @@ class StateManager:
 
     def unblock_email(self, email: str) -> bool:
         if email in self.state.get("blocked_emails", {}):
-            del self.state.get("blocked_emails", {})[email]
+            # ✅ FIXED: correct delete
+            del self.state["blocked_emails"][email]
             self._save_state()
             return True
         return False
@@ -213,6 +246,44 @@ class StateManager:
             self._save_state()
             return True
         return False
+
+    # ✅ NEW: checklist stored in state.json (NO REDIS)
+    def checklist_get(self) -> list[str]:
+        return list(self.state.get(CHECKLIST_STATE_KEY, []))
+
+    def checklist_add(self, emails: list[str]) -> tuple[int, int]:
+        """
+        returns (added, skipped_invalid_domain_or_format)
+        """
+        cur = set(self.state.get(CHECKLIST_STATE_KEY, []))
+        added = 0
+        skipped = 0
+        for e in emails:
+            e = (e or "").strip().lower()
+            if not _looks_like_email(e) or not _is_allowed_domain(e):
+                skipped += 1
+                continue
+            if e not in cur:
+                cur.add(e)
+                added += 1
+        self.state[CHECKLIST_STATE_KEY] = sorted(cur)
+        self._save_state()
+        return added, skipped
+
+    def checklist_remove(self, emails: list[str]) -> int:
+        cur = set(self.state.get(CHECKLIST_STATE_KEY, []))
+        before = len(cur)
+        for e in emails:
+            e = (e or "").strip().lower()
+            if e in cur:
+                cur.remove(e)
+        self.state[CHECKLIST_STATE_KEY] = sorted(cur)
+        self._save_state()
+        return before - len(cur)
+
+    def checklist_clear(self):
+        self.state[CHECKLIST_STATE_KEY] = []
+        self._save_state()
 
 
 state_manager = StateManager(STATE_FILE)
@@ -319,7 +390,7 @@ async def fetch_otp_from_generator(email: str) -> Optional[str]:
     return None
 
 
-# ✅ NEW: EXACT subject match in inbox list (best-effort using <a> text)
+# ✅ subject check: EXACT match of subject text in inbox list (best-effort)
 async def inbox_has_subject_exact(email: str, subject_exact: str) -> bool:
     inbox_url = f"https://generator.email/{email}"
     want = _norm_spaces(subject_exact)
@@ -349,10 +420,18 @@ async def inbox_has_subject_exact(email: str, subject_exact: str) -> bool:
 
         rows = email_table.find_all("tr")
         for row in rows:
+            # 1) best: anchor text
             a = row.find("a")
             if a:
                 subj = _norm_spaces(a.get_text(" ", strip=True))
                 if subj == want:
+                    return True
+
+            # 2) fallback: any td equals subject
+            tds = row.find_all("td")
+            for td in tds:
+                td_text = _norm_spaces(td.get_text(" ", strip=True))
+                if td_text == want:
                     return True
 
         return False
@@ -596,6 +675,7 @@ async def remaining_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     current_requests = state_manager.get_user_requests(user.id)
+    remaining = MAX_REQUESTS_PER_USER - current_requests
     cd = state_manager.remaining_cooldown(user.id)
 
     if cd > 0:
@@ -674,6 +754,13 @@ async def block_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     state_manager.block_email(email, user.id)
+
+    try:
+        with open("otp_log.txt", "a") as lf:
+            lf.write(f"[{datetime.now()}] user={user.id} email={email} action=BLOCK\n")
+    except Exception:
+        pass
+
     await update.message.reply_text("✅ Done.")
 
 
@@ -698,6 +785,13 @@ async def unblock_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     ok = state_manager.unblock_email(email)
+
+    try:
+        with open("otp_log.txt", "a") as lf:
+            lf.write(f"[{datetime.now()}] user={user.id} email={email} action=UNBLOCK ok={ok}\n")
+    except Exception:
+        pass
+
     await update.message.reply_text("✅ Done." if ok else "ℹ️ Not found.")
 
 
@@ -707,7 +801,7 @@ async def showlog_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if user.id not in ADMIN_IDS:
-        await update.message.reply_text("⛔ Admin only.")
+        await update.message.reply_text("⛔ This command is restricted to admins only.")
         return
 
     log_file = "otp_log.txt"
@@ -786,7 +880,7 @@ async def dash_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             "❌ Usage:\n"
             "1) /dash <text to broadcast>\n"
-            "2) Reply to a message with /dash to broadcast it."
+            "2) Reply to a message (photo/text/etc) with /dash to broadcast it."
         )
         return
 
@@ -840,7 +934,7 @@ async def addusers_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(f"✅ Added {after - before} users to subscribers.")
 
 
-# ✅ Watchlist commands (admin only) using Redis
+# ✅ Watchlist commands (admin only) using Redis (still optional)
 async def wadd_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
@@ -856,9 +950,16 @@ async def wadd_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ REDIS_URL is not set. Cannot use watchlist commands.")
         return
 
-    emails = _split_emails_arg(context.args)
-    if not emails:
+    if not context.args:
         await update.message.reply_text("❌ Usage: /wadd email@domain OR /wadd a@d.com,b@d.com")
+        return
+
+    raw = " ".join(context.args).strip().lower()
+    parts = re.split(r"[,\s]+", raw)
+    emails = [p.strip() for p in parts if p.strip()]
+
+    if not emails:
+        await update.message.reply_text("❌ No emails found.")
         return
 
     added = 0
@@ -882,6 +983,9 @@ async def wadd_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = f"✅ Added: {added}\nℹ️ Already in list: {already}"
     if invalid:
         msg += "\n❌ Invalid domain:\n" + "\n".join(f"• {e}" for e in invalid[:30])
+        if len(invalid) > 30:
+            msg += f"\n… +{len(invalid) - 30} more"
+
     await update.message.reply_text(msg)
 
 
@@ -900,10 +1004,13 @@ async def wremove_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ REDIS_URL is not set. Cannot use watchlist commands.")
         return
 
-    emails = _split_emails_arg(context.args)
-    if not emails:
+    if not context.args:
         await update.message.reply_text("❌ Usage: /wremove email@domain OR /wremove a@d.com,b@d.com")
         return
+
+    raw = " ".join(context.args).strip().lower()
+    parts = re.split(r"[,\s]+", raw)
+    emails = [p.strip() for p in parts if p.strip()]
 
     removed = 0
     not_found = 0
@@ -926,6 +1033,9 @@ async def wremove_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = f"✅ Removed: {removed}\nℹ️ Not found: {not_found}"
     if invalid:
         msg += "\n❌ Invalid domain:\n" + "\n".join(f"• {e}" for e in invalid[:30])
+        if len(invalid) > 30:
+            msg += f"\n… +{len(invalid) - 30} more"
+
     await update.message.reply_text(msg)
 
 
@@ -1004,7 +1114,7 @@ async def winterval_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ===========================
-# ✅ NEW: /elistadd + /elist + /elistclear + /elistremove + ONLY /check
+# ✅ NEW FEATURE (NO REDIS): checklist + /check only
 # ===========================
 
 async def elistadd_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1017,39 +1127,24 @@ async def elistadd_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Admin only.")
         return
 
-    if not REDIS_URL or redis_client is None:
-        await update.message.reply_text("❌ REDIS_URL is not set. Cannot use /elist commands.")
-        return
+    # Supports BOTH:
+    # /elistadd a@d.com,b@d.com
+    # /elistadd
+    # a@d.com
+    # b@d.com
+    blob = _extract_text_after_command(update, "/elistadd")
+    if not blob:
+        blob = " ".join(context.args or [])
 
-    emails = _split_emails_arg(context.args)
+    emails = _parse_emails_from_blob(blob)
     if not emails:
-        await update.message.reply_text("❌ Usage: /elistadd a@d.com,b@d.com")
+        await update.message.reply_text("❌ Usage: /elistadd email1,email2 OR paste lines after /elistadd")
         return
 
-    valid, invalid = [], []
-    for e in emails:
-        if _looks_like_email(e) and _is_allowed_domain(e):
-            valid.append(e.lower())
-        else:
-            invalid.append(e)
+    added, skipped = state_manager.checklist_add(emails)
+    total = len(state_manager.checklist_get())
 
-    if not valid:
-        await update.message.reply_text("❌ No valid emails to add (check domain + format).")
-        return
-
-    added = 0
-    already = 0
-    for e in valid:
-        ok = await redis_client.sadd(CHECKLIST_KEY, e)
-        if ok:
-            added += 1
-        else:
-            already += 1
-
-    msg = f"✅ Checklist updated.\nAdded: {added}\nAlready: {already}"
-    if invalid:
-        msg += "\n\n❌ Skipped invalid:\n" + "\n".join(f"• {x}" for x in invalid[:30])
-
+    msg = f"✅ Checklist updated.\nAdded: {added}\nSkipped (invalid): {skipped}\nTotal saved: {total}"
     await update.message.reply_text(msg)
 
 
@@ -1063,20 +1158,18 @@ async def elistremove_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("⛔ Admin only.")
         return
 
-    if not REDIS_URL or redis_client is None:
-        await update.message.reply_text("❌ REDIS_URL is not set. Cannot use /elist commands.")
-        return
+    blob = _extract_text_after_command(update, "/elistremove")
+    if not blob:
+        blob = " ".join(context.args or [])
 
-    emails = _split_emails_arg(context.args)
+    emails = _parse_emails_from_blob(blob)
     if not emails:
-        await update.message.reply_text("❌ Usage: /elistremove a@d.com,b@d.com")
+        await update.message.reply_text("❌ Usage: /elistremove email1,email2")
         return
 
-    removed = 0
-    for e in emails:
-        removed += int(await redis_client.srem(CHECKLIST_KEY, e.lower().strip()))
-
-    await update.message.reply_text(f"✅ Removed: {removed}")
+    removed = state_manager.checklist_remove(emails)
+    total = len(state_manager.checklist_get())
+    await update.message.reply_text(f"✅ Removed: {removed}\nTotal saved: {total}")
 
 
 async def elist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1089,11 +1182,7 @@ async def elist_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Admin only.")
         return
 
-    if not REDIS_URL or redis_client is None:
-        await update.message.reply_text("❌ REDIS_URL is not set. Cannot use /elist commands.")
-        return
-
-    items = sorted(list(await redis_client.smembers(CHECKLIST_KEY)))
+    items = state_manager.checklist_get()
     if not items:
         await update.message.reply_text("ℹ️ Checklist is empty.")
         return
@@ -1114,15 +1203,11 @@ async def elistclear_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         await update.message.reply_text("⛔ Admin only.")
         return
 
-    if not REDIS_URL or redis_client is None:
-        await update.message.reply_text("❌ REDIS_URL is not set. Cannot use /elist commands.")
-        return
-
-    await redis_client.delete(CHECKLIST_KEY)
+    state_manager.checklist_clear()
     await update.message.reply_text("✅ Checklist cleared.")
 
 
-# ✅ ONLY /check (no arguments, fixed subject)
+# ✅ ONLY /check (no args, fixed subject)
 async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
@@ -1133,11 +1218,7 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Admin only.")
         return
 
-    if not REDIS_URL or redis_client is None:
-        await update.message.reply_text("❌ REDIS_URL is not set. Cannot use /check.")
-        return
-
-    emails = sorted(list(await redis_client.smembers(CHECKLIST_KEY)))
+    emails = state_manager.checklist_get()
     if not emails:
         await update.message.reply_text("ℹ️ Checklist is empty. Add emails using /elistadd first.")
         return
@@ -1195,10 +1276,10 @@ def _build_application() -> Application:
 
     app.add_handler(CommandHandler("start", start_command))
 
-    # user sends email as normal message (no /otp)
+    # ✅ user sends email as normal message (no /otp)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, email_message_handler))
 
-    # other commands
+    # keep other commands (original)
     app.add_handler(CommandHandler("remaining", remaining_command))
     app.add_handler(CommandHandler("resetlimit", resetlimit_command))
     app.add_handler(CommandHandler("clearemail", clearemail_command))
@@ -1208,13 +1289,13 @@ def _build_application() -> Application:
     app.add_handler(CommandHandler("dash", dash_command))
     app.add_handler(CommandHandler("addusers", addusers_command))
 
-    # watchlist commands
+    # watchlist (redis optional, only works if REDIS_URL set)
     app.add_handler(CommandHandler("wadd", wadd_command))
     app.add_handler(CommandHandler("wremove", wremove_command))
     app.add_handler(CommandHandler("wlist", wlist_command))
     app.add_handler(CommandHandler("winterval", winterval_command))
 
-    # ✅ NEW: email checklist + ONLY /check
+    # ✅ NEW: checklist (NO redis) + ONLY /check
     app.add_handler(CommandHandler("elistadd", elistadd_command))
     app.add_handler(CommandHandler("elistremove", elistremove_command))
     app.add_handler(CommandHandler("elist", elist_command))
@@ -1234,10 +1315,6 @@ def main():
     if not ALLOWED_DOMAIN:
         logger.error("ALLOWED_DOMAIN environment variable is not set or empty!")
         print("❌ ERROR: ALLOWED_DOMAIN environment variable is required (comma-separated if multiple).")
-        return
-
-    if not REDIS_URL:
-        print("❌ ERROR: REDIS_URL is required for /elist + /check in this version.")
         return
 
     logger.info("Starting OTP bot...")
