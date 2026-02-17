@@ -54,6 +54,9 @@ REDIS_URL = os.getenv("REDIS_URL", "").strip()
 # Self-healing knobs (optional)
 RESTART_EVERY_MIN = int(os.getenv("RESTART_EVERY_MIN", "0"))  # 0 = disabled
 ERROR_RESTART_THRESHOLD = int(os.getenv("ERROR_RESTART_THRESHOLD", "6"))
+
+# ✅ Auto /check interval
+AUTO_CHECK_EVERY_HOURS = int(os.getenv("AUTO_CHECK_EVERY_HOURS", "6"))
 # ---------------------------
 
 OTP_PATTERN = re.compile(r"\b(\d{6})\b")
@@ -125,6 +128,11 @@ def _parse_emails_from_blob(blob: str) -> list[str]:
         if p:
             emails.append(p)
     return emails
+
+
+def _inbox_link(email: str) -> str:
+    # generator.email supports /<email> which redirects correctly
+    return f"https://generator.email/{email}"
 
 
 # ✅ Redis client (ONLY used by watchlist commands)
@@ -382,7 +390,7 @@ async def fetch_otp_from_generator(email: str) -> Optional[str]:
     return None
 
 
-# ✅✅✅ FIXED subject check: OPEN message links + check real subject in message pages (+ iframe)
+# ✅ subject check: OPEN message links + check real subject in message pages (+ iframe)
 async def inbox_has_subject_exact(email: str, subject_exact: str) -> bool:
     want = _norm_spaces(subject_exact)
     if not want:
@@ -405,10 +413,7 @@ async def inbox_has_subject_exact(email: str, subject_exact: str) -> bool:
 
     max_retries = 3
 
-    async with httpx.AsyncClient(
-        timeout=httpx.Timeout(30.0),
-        follow_redirects=True,
-    ) as client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0), follow_redirects=True) as client:
         for attempt in range(1, max_retries + 1):
             try:
                 resp = await client.get(inbox_url, headers=headers)
@@ -435,7 +440,6 @@ async def inbox_has_subject_exact(email: str, subject_exact: str) -> bool:
                 if not links:
                     return False
 
-                # scan enough old messages
                 MAX_TO_SCAN = 30
 
                 for msg_url in links[:MAX_TO_SCAN]:
@@ -444,24 +448,20 @@ async def inbox_has_subject_exact(email: str, subject_exact: str) -> bool:
                         msg_resp.raise_for_status()
                         msg_soup = BeautifulSoup(msg_resp.text, "html.parser")
 
-                        # 1) <title>
                         title = _norm_spaces(msg_soup.title.get_text() if msg_soup.title else "")
                         if title == want:
                             return True
 
-                        # 2) <h1>
                         h1 = msg_soup.find("h1")
                         if h1:
                             h1_text = _norm_spaces(h1.get_text(" ", strip=True))
                             if h1_text == want:
                                 return True
 
-                        # 3) search full visible text
                         full_text = _norm_spaces(msg_soup.get_text(" ", strip=True))
                         if want in full_text:
                             return True
 
-                        # 4) iframe
                         iframe = msg_soup.find("iframe", src=True)
                         if iframe and iframe.get("src"):
                             iframe_src = iframe["src"].strip()
@@ -523,6 +523,54 @@ def _note_net_error_and_maybe_restart():
             "Exiting for Railway to auto-restart."
         )
         os._exit(1)
+
+
+# ---------------- /check core runner (used by manual + auto) ----------------
+async def run_check_and_format(emails: list[str]) -> tuple[list[str], int, list[str], str]:
+    """
+    returns: (found_emails, not_found_count, failed_emails, formatted_message)
+    """
+    found = []
+    not_found = 0
+    failed = []
+
+    for email in emails:
+        try:
+            ok = await inbox_has_subject_exact(email, FIXED_SUBJECT)
+            if ok:
+                found.append(email)
+            else:
+                not_found += 1
+        except Exception as e:
+            logger.error(f"/check error for {email}: {e}")
+            failed.append(email)
+
+        await asyncio.sleep(0.2)
+
+    if found:
+        lines = []
+        for e in found:
+            link = _inbox_link(e)
+            lines.append(f"• {e}\n  🔗 {link}")
+        msg = (
+            "✅ Check done.\n\n"
+            f"🎯 Found subject: “{FIXED_SUBJECT}” in:\n"
+            + "\n".join(lines)
+            + f"\n\n📭 Not found in: {not_found} inbox(es)."
+        )
+    else:
+        msg = (
+            "✅ Check done.\n\n"
+            f"❌ Subject not found in any inbox.\n\n"
+            f"Target subject: “{FIXED_SUBJECT}”"
+        )
+
+    if failed:
+        msg += "\n\n⚠️ Failed to check (network/blocked):\n" + "\n".join(f"• {e} ({_inbox_link(e)})" for e in failed[:40])
+        if len(failed) > 40:
+            msg += f"\n… +{len(failed) - 40} more"
+
+    return found, not_found, failed, msg
 
 
 # ---------------- Commands ----------------
@@ -714,7 +762,6 @@ async def email_message_handler(update: Update, context: ContextTypes.DEFAULT_TY
     if not text:
         return
 
-    # ignore if it's a command just in case
     if text.startswith("/"):
         return
 
@@ -730,7 +777,6 @@ async def remaining_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     current_requests = state_manager.get_user_requests(user.id)
-    remaining = MAX_REQUESTS_PER_USER - current_requests
     cd = state_manager.remaining_cooldown(user.id)
 
     if cd > 0:
@@ -1257,7 +1303,7 @@ async def elistclear_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     await update.message.reply_text("✅ Checklist cleared.")
 
 
-# ✅ ONLY /check (no args, fixed subject)
+# ✅ ONLY /check (no args, fixed subject) - MANUAL
 async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
         return
@@ -1279,35 +1325,36 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"(Checking one-by-one, no skipping.)"
     )
 
-    found = []
-    not_found = 0
-    failed = []
-
-    for email in emails:
-        try:
-            ok = await inbox_has_subject_exact(email, FIXED_SUBJECT)
-            if ok:
-                found.append(email)
-            else:
-                not_found += 1
-        except Exception as e:
-            logger.error(f"/check error for {email}: {e}")
-            failed.append(email)
-
-        await asyncio.sleep(0.2)
-
-    if found:
-        msg = "✅ Check done.\n\n🎯 Found in:\n" + "\n".join(f"• {e}" for e in found)
-        msg += f"\n\n📭 Not found in: {not_found} inbox(es)."
-    else:
-        msg = "✅ Check done.\n\n❌ Not found in any inbox."
-
-    if failed:
-        msg += "\n\n⚠️ Failed to check (network/blocked):\n" + "\n".join(f"• {e}" for e in failed[:40])
-        if len(failed) > 40:
-            msg += f"\n… +{len(failed) - 40} more"
-
+    _, _, _, msg = await run_check_and_format(emails)
     await update.message.reply_text(msg)
+
+
+# ✅ AUTO /check job (every 6 hours)
+async def auto_check_job(context: ContextTypes.DEFAULT_TYPE):
+    emails = state_manager.checklist_get()
+    if not emails:
+        return
+
+    subscribers = state_manager.get_subscribers()
+    if not subscribers:
+        return
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    header = f"⏰ Auto /check ({AUTO_CHECK_EVERY_HOURS}h) — {now}\nTarget subject: “{FIXED_SUBJECT}”\n\n"
+
+    _, _, _, msg = await run_check_and_format(emails)
+    final_msg = header + msg
+
+    for chat_id in subscribers:
+        try:
+            await context.bot.send_message(chat_id=chat_id, text=final_msg)
+            await asyncio.sleep(0.05)
+        except RetryAfter as e:
+            await asyncio.sleep(int(getattr(e, "retry_after", 1)))
+        except Forbidden:
+            state_manager.remove_subscriber(chat_id)
+        except Exception:
+            pass
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
@@ -1356,6 +1403,17 @@ def _build_application() -> Application:
     app.add_handler(CommandHandler("check", check_command))
 
     app.add_error_handler(error_handler)
+
+    # ✅ schedule auto /check every 6 hours (starts shortly after boot)
+    if app.job_queue:
+        app.job_queue.run_repeating(
+            auto_check_job,
+            interval=AUTO_CHECK_EVERY_HOURS * 60 * 60,
+            first=60,  # first run after 60s from start
+            name="auto_check_every_6h",
+        )
+        logger.info(f"Auto /check scheduled every {AUTO_CHECK_EVERY_HOURS} hours.")
+
     return app
 
 
