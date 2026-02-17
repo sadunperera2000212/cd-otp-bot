@@ -105,7 +105,6 @@ def _extract_text_after_command(update: Update, command: str) -> str:
     if not update.message or not update.message.text:
         return ""
     txt = update.message.text.strip()
-    # command could be "/elistadd" exactly
     if not txt.lower().startswith(command.lower()):
         return ""
     rest = txt[len(command):].strip()
@@ -154,10 +153,7 @@ class StateManager:
         data.setdefault("cooldowns", {})
         data.setdefault("blocked_emails", {})
         data.setdefault("subscribers", [])
-
-        # ✅ NEW: store checklist (no Redis)
         data.setdefault(CHECKLIST_STATE_KEY, [])
-
         return data
 
     def _save_state(self):
@@ -223,7 +219,6 @@ class StateManager:
 
     def unblock_email(self, email: str) -> bool:
         if email in self.state.get("blocked_emails", {}):
-            # ✅ FIXED: correct delete
             del self.state["blocked_emails"][email]
             self._save_state()
             return True
@@ -247,14 +242,11 @@ class StateManager:
             return True
         return False
 
-    # ✅ NEW: checklist stored in state.json (NO REDIS)
+    # ✅ checklist stored in state.json (NO REDIS)
     def checklist_get(self) -> list[str]:
         return list(self.state.get(CHECKLIST_STATE_KEY, []))
 
     def checklist_add(self, emails: list[str]) -> tuple[int, int]:
-        """
-        returns (added, skipped_invalid_domain_or_format)
-        """
         cur = set(self.state.get(CHECKLIST_STATE_KEY, []))
         added = 0
         skipped = 0
@@ -390,12 +382,13 @@ async def fetch_otp_from_generator(email: str) -> Optional[str]:
     return None
 
 
-# ✅ subject check: EXACT match of subject text in inbox list (best-effort)
+# ✅✅✅ FIXED subject check: OPEN message links + check real subject in message pages (+ iframe)
 async def inbox_has_subject_exact(email: str, subject_exact: str) -> bool:
-    inbox_url = f"https://generator.email/{email}"
     want = _norm_spaces(subject_exact)
     if not want:
         return False
+
+    inbox_url = f"https://generator.email/{email}"
 
     headers = {
         "User-Agent": (
@@ -406,35 +399,97 @@ async def inbox_has_subject_exact(email: str, subject_exact: str) -> bool:
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.5",
         "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
         "Referer": "https://generator.email/",
     }
 
-    async with httpx.AsyncClient(timeout=httpx.Timeout(25.0), follow_redirects=True) as client:
-        resp = await client.get(inbox_url, headers=headers)
-        resp.raise_for_status()
+    max_retries = 3
 
-        soup = BeautifulSoup(resp.text, "html.parser")
-        email_table = soup.find(id="email-table")
-        if not email_table:
-            return False
+    async with httpx.AsyncClient(
+        timeout=httpx.Timeout(30.0),
+        follow_redirects=True,
+    ) as client:
+        for attempt in range(1, max_retries + 1):
+            try:
+                resp = await client.get(inbox_url, headers=headers)
+                resp.raise_for_status()
 
-        rows = email_table.find_all("tr")
-        for row in rows:
-            # 1) best: anchor text
-            a = row.find("a")
-            if a:
-                subj = _norm_spaces(a.get_text(" ", strip=True))
-                if subj == want:
-                    return True
+                soup = BeautifulSoup(resp.text, "html.parser")
+                email_table = soup.find(id="email-table")
+                if not email_table:
+                    return False
 
-            # 2) fallback: any td equals subject
-            tds = row.find_all("td")
-            for td in tds:
-                td_text = _norm_spaces(td.get_text(" ", strip=True))
-                if td_text == want:
-                    return True
+                links = []
+                for a in email_table.find_all("a", href=True):
+                    href = (a.get("href") or "").strip()
+                    if not href:
+                        continue
+                    if href.startswith("/"):
+                        href = "https://generator.email" + href
+                    elif href.startswith("http"):
+                        pass
+                    else:
+                        href = "https://generator.email/" + href
+                    links.append(href)
 
-        return False
+                if not links:
+                    return False
+
+                # scan enough old messages
+                MAX_TO_SCAN = 30
+
+                for msg_url in links[:MAX_TO_SCAN]:
+                    try:
+                        msg_resp = await client.get(msg_url, headers={**headers, "Referer": inbox_url})
+                        msg_resp.raise_for_status()
+                        msg_soup = BeautifulSoup(msg_resp.text, "html.parser")
+
+                        # 1) <title>
+                        title = _norm_spaces(msg_soup.title.get_text() if msg_soup.title else "")
+                        if title == want:
+                            return True
+
+                        # 2) <h1>
+                        h1 = msg_soup.find("h1")
+                        if h1:
+                            h1_text = _norm_spaces(h1.get_text(" ", strip=True))
+                            if h1_text == want:
+                                return True
+
+                        # 3) search full visible text
+                        full_text = _norm_spaces(msg_soup.get_text(" ", strip=True))
+                        if want in full_text:
+                            return True
+
+                        # 4) iframe
+                        iframe = msg_soup.find("iframe", src=True)
+                        if iframe and iframe.get("src"):
+                            iframe_src = iframe["src"].strip()
+                            if iframe_src.startswith("/"):
+                                iframe_url = "https://generator.email" + iframe_src
+                            elif iframe_src.startswith("http"):
+                                iframe_url = iframe_src
+                            else:
+                                iframe_url = "https://generator.email/" + iframe_src
+
+                            iframe_resp = await client.get(iframe_url, headers={**headers, "Referer": msg_url})
+                            iframe_resp.raise_for_status()
+                            iframe_soup = BeautifulSoup(iframe_resp.text, "html.parser")
+                            iframe_text = _norm_spaces(iframe_soup.get_text(" ", strip=True))
+                            if want in iframe_text:
+                                return True
+
+                    except httpx.HTTPError:
+                        continue
+
+                return False
+
+            except httpx.HTTPError as e:
+                logger.error(f"inbox_has_subject_exact error (attempt {attempt}/{max_retries}) for {email}: {e}")
+                if attempt < max_retries:
+                    await asyncio.sleep(2 * attempt)
+                    continue
+                return False
 
 
 # ---------------- Self-healing helpers ----------------
@@ -1127,11 +1182,6 @@ async def elistadd_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Admin only.")
         return
 
-    # Supports BOTH:
-    # /elistadd a@d.com,b@d.com
-    # /elistadd
-    # a@d.com
-    # b@d.com
     blob = _extract_text_after_command(update, "/elistadd")
     if not blob:
         blob = " ".join(context.args or [])
@@ -1231,6 +1281,7 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     found = []
     not_found = 0
+    failed = []
 
     for email in emails:
         try:
@@ -1241,7 +1292,7 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 not_found += 1
         except Exception as e:
             logger.error(f"/check error for {email}: {e}")
-            not_found += 1
+            failed.append(email)
 
         await asyncio.sleep(0.2)
 
@@ -1250,6 +1301,11 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         msg += f"\n\n📭 Not found in: {not_found} inbox(es)."
     else:
         msg = "✅ Check done.\n\n❌ Not found in any inbox."
+
+    if failed:
+        msg += "\n\n⚠️ Failed to check (network/blocked):\n" + "\n".join(f"• {e}" for e in failed[:40])
+        if len(failed) > 40:
+            msg += f"\n… +{len(failed) - 40} more"
 
     await update.message.reply_text(msg)
 
@@ -1275,11 +1331,8 @@ def _build_application() -> Application:
     )
 
     app.add_handler(CommandHandler("start", start_command))
-
-    # ✅ user sends email as normal message (no /otp)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, email_message_handler))
 
-    # keep other commands (original)
     app.add_handler(CommandHandler("remaining", remaining_command))
     app.add_handler(CommandHandler("resetlimit", resetlimit_command))
     app.add_handler(CommandHandler("clearemail", clearemail_command))
@@ -1289,13 +1342,13 @@ def _build_application() -> Application:
     app.add_handler(CommandHandler("dash", dash_command))
     app.add_handler(CommandHandler("addusers", addusers_command))
 
-    # watchlist (redis optional, only works if REDIS_URL set)
+    # watchlist (redis optional)
     app.add_handler(CommandHandler("wadd", wadd_command))
     app.add_handler(CommandHandler("wremove", wremove_command))
     app.add_handler(CommandHandler("wlist", wlist_command))
     app.add_handler(CommandHandler("winterval", winterval_command))
 
-    # ✅ NEW: checklist (NO redis) + ONLY /check
+    # checklist + check
     app.add_handler(CommandHandler("elistadd", elistadd_command))
     app.add_handler(CommandHandler("elistremove", elistremove_command))
     app.add_handler(CommandHandler("elist", elist_command))
