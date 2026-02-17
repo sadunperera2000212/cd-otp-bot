@@ -1330,31 +1330,31 @@ async def check_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ✅ AUTO /check job (every 6 hours)
+# ✅ AUTO /check job (every 6 hours) - ADMINS ONLY
 async def auto_check_job(context: ContextTypes.DEFAULT_TYPE):
     emails = state_manager.checklist_get()
     if not emails:
         return
 
-    subscribers = state_manager.get_subscribers()
-    if not subscribers:
-        return
-
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    header = f"⏰ Auto /check ({AUTO_CHECK_EVERY_HOURS}h) — {now}\nTarget subject: “{FIXED_SUBJECT}”\n\n"
+    header = (
+        f"⏰ Auto /check ({AUTO_CHECK_EVERY_HOURS}h) — {now}\n"
+        f"Target subject: “{FIXED_SUBJECT}”\n\n"
+    )
 
     _, _, _, msg = await run_check_and_format(emails)
     final_msg = header + msg
 
-    for chat_id in subscribers:
+    # ✅ SEND ONLY TO ADMINS
+    for admin_id in ADMIN_IDS:
         try:
-            await context.bot.send_message(chat_id=chat_id, text=final_msg)
-            await asyncio.sleep(0.05)
+            await context.bot.send_message(chat_id=admin_id, text=final_msg)
+            await asyncio.sleep(0.1)
         except RetryAfter as e:
             await asyncio.sleep(int(getattr(e, "retry_after", 1)))
-        except Forbidden:
-            state_manager.remove_subscriber(chat_id)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.error(f"Auto-check send error to admin {admin_id}: {e}")
+
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
